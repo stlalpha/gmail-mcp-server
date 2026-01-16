@@ -3,10 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"html/template"
 	"log"
 	"net/http"
 	"os"
@@ -14,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	htmltomarkdown "github.com/JohannesKaufmann/html-to-markdown/v2"
@@ -36,13 +39,724 @@ type GmailServer struct {
 	userID  string
 }
 
+// ============================================================================
+// OOB Approval System - Agent Cut-Out Pattern
+// See docs/agent-cut-out-pattern.md for details
+// ============================================================================
+
+// ApprovalResult is sent back to the blocked send_draft call
+type ApprovalResult struct {
+	Approved bool
+	Error    error
+}
+
+// PendingEmail represents an email waiting for user approval
+type PendingEmail struct {
+	ID       string              // Unique ID for this pending request
+	DraftID  string              // Gmail draft ID
+	To       string              // Recipient
+	Subject  string              // Email subject
+	Body     string              // Full email body
+	QueuedAt time.Time           // When the request was queued
+	ResultCh chan ApprovalResult // Channel to send result back to blocked caller
+}
+
+// ApprovalSession manages the OOB approval state
+type ApprovalSession struct {
+	ID         string // Crypto-random session ID for URL
+	CreatedAt  time.Time
+	Pending    *PendingEmail // Only ONE pending email at a time
+	History    []EmailHistoryEntry
+	mu         sync.Mutex
+	sseClients map[chan string]bool // SSE clients for real-time updates
+}
+
+// EmailHistoryEntry records sent/rejected emails
+type EmailHistoryEntry struct {
+	DraftID   string
+	To        string
+	Subject   string
+	Action    string // "sent" or "rejected"
+	Timestamp time.Time
+}
+
+// Global approval session (created on server start)
+var approvalSession *ApprovalSession
+
+// NewApprovalSession creates a new session with a crypto-random ID
+func NewApprovalSession() (*ApprovalSession, error) {
+	// Generate 32 bytes of randomness for session ID
+	randomBytes := make([]byte, 32)
+	if _, err := rand.Read(randomBytes); err != nil {
+		return nil, fmt.Errorf("failed to generate session ID: %v", err)
+	}
+
+	sessionID := base64.URLEncoding.EncodeToString(randomBytes)
+	// Remove padding for cleaner URLs
+	sessionID = strings.TrimRight(sessionID, "=")
+
+	return &ApprovalSession{
+		ID:         sessionID,
+		CreatedAt:  time.Now(),
+		History:    make([]EmailHistoryEntry, 0),
+		sseClients: make(map[chan string]bool),
+	}, nil
+}
+
+// QueueEmail queues an email for approval, returns error if one is already pending
+func (s *ApprovalSession) QueueEmail(draftID, to, subject, body string) (*PendingEmail, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.Pending != nil {
+		return nil, fmt.Errorf("another email is already pending approval - only one at a time allowed")
+	}
+
+	// Generate unique ID for this pending request
+	idBytes := make([]byte, 8)
+	rand.Read(idBytes)
+	pendingID := base64.URLEncoding.EncodeToString(idBytes)
+	pendingID = strings.TrimRight(pendingID, "=")
+
+	pending := &PendingEmail{
+		ID:       pendingID,
+		DraftID:  draftID,
+		To:       to,
+		Subject:  subject,
+		Body:     body,
+		QueuedAt: time.Now(),
+		ResultCh: make(chan ApprovalResult, 1),
+	}
+
+	s.Pending = pending
+
+	// Notify SSE clients
+	s.broadcastUpdate()
+
+	return pending, nil
+}
+
+// Approve approves the pending email
+func (s *ApprovalSession) Approve() (*PendingEmail, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.Pending == nil {
+		return nil, fmt.Errorf("no email pending approval")
+	}
+
+	pending := s.Pending
+	s.Pending = nil
+
+	// Record in history
+	s.History = append(s.History, EmailHistoryEntry{
+		DraftID:   pending.DraftID,
+		To:        pending.To,
+		Subject:   pending.Subject,
+		Action:    "sent",
+		Timestamp: time.Now(),
+	})
+
+	// Notify SSE clients
+	s.broadcastUpdate()
+
+	return pending, nil
+}
+
+// Reject rejects the pending email
+func (s *ApprovalSession) Reject() (*PendingEmail, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.Pending == nil {
+		return nil, fmt.Errorf("no email pending approval")
+	}
+
+	pending := s.Pending
+	s.Pending = nil
+
+	// Record in history
+	s.History = append(s.History, EmailHistoryEntry{
+		DraftID:   pending.DraftID,
+		To:        pending.To,
+		Subject:   pending.Subject,
+		Action:    "rejected",
+		Timestamp: time.Now(),
+	})
+
+	// Notify SSE clients
+	s.broadcastUpdate()
+
+	return pending, nil
+}
+
+// GetPending returns the current pending email (thread-safe)
+func (s *ApprovalSession) GetPending() *PendingEmail {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Pending
+}
+
+// AddSSEClient registers a new SSE client
+func (s *ApprovalSession) AddSSEClient(ch chan string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sseClients[ch] = true
+}
+
+// RemoveSSEClient unregisters an SSE client
+func (s *ApprovalSession) RemoveSSEClient(ch chan string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.sseClients, ch)
+	close(ch)
+}
+
+// broadcastUpdate notifies all SSE clients of a state change
+func (s *ApprovalSession) broadcastUpdate() {
+	for ch := range s.sseClients {
+		select {
+		case ch <- "update":
+		default:
+			// Client not ready, skip
+		}
+	}
+}
+
+// ============================================================================
+// OOB Web Server - Agent-Inaccessible Approval Dashboard
+// ============================================================================
+
+const oobServerPort = 8787
+
+// StartOOBServer starts the out-of-band approval web server
+func StartOOBServer(gmailServer *GmailServer) {
+	mux := http.NewServeMux()
+
+	// Dashboard page
+	mux.HandleFunc("/outbox/", func(w http.ResponseWriter, r *http.Request) {
+		// Extract session ID from path
+		pathParts := strings.Split(r.URL.Path, "/")
+		if len(pathParts) < 3 || pathParts[2] == "" {
+			http.Error(w, "Invalid session URL", http.StatusBadRequest)
+			return
+		}
+		sessionID := pathParts[2]
+
+		// Validate session ID
+		if approvalSession == nil || approvalSession.ID != sessionID {
+			http.Error(w, "Invalid or expired session", http.StatusForbidden)
+			return
+		}
+
+		// Serve the dashboard HTML
+		serveDashboard(w, r)
+	})
+
+	// API: Get pending email
+	mux.HandleFunc("/api/pending/", func(w http.ResponseWriter, r *http.Request) {
+		pathParts := strings.Split(r.URL.Path, "/")
+		if len(pathParts) < 4 {
+			http.Error(w, "Invalid URL", http.StatusBadRequest)
+			return
+		}
+		sessionID := pathParts[3]
+
+		if approvalSession == nil || approvalSession.ID != sessionID {
+			http.Error(w, "Invalid session", http.StatusForbidden)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		pending := approvalSession.GetPending()
+		if pending == nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"pending": false,
+			})
+			return
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"pending":   true,
+			"id":        pending.ID,
+			"draftId":   pending.DraftID,
+			"to":        pending.To,
+			"subject":   pending.Subject,
+			"body":      pending.Body,
+			"queuedAt":  pending.QueuedAt.Format(time.RFC3339),
+			"expiresIn": int(5*time.Minute - time.Since(pending.QueuedAt).Round(time.Second)/time.Second),
+		})
+	})
+
+	// API: Approve pending email
+	mux.HandleFunc("/api/approve/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		pathParts := strings.Split(r.URL.Path, "/")
+		if len(pathParts) < 4 {
+			http.Error(w, "Invalid URL", http.StatusBadRequest)
+			return
+		}
+		sessionID := pathParts[3]
+
+		if approvalSession == nil || approvalSession.ID != sessionID {
+			http.Error(w, "Invalid session", http.StatusForbidden)
+			return
+		}
+
+		pending, err := approvalSession.Approve()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		// Send the email via Gmail API
+		err = gmailServer.SendDraft(pending.DraftID)
+		if err != nil {
+			// Put back in history as failed
+			log.Printf("Failed to send email: %v", err)
+			pending.ResultCh <- ApprovalResult{Approved: false, Error: err}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"error":   err.Error(),
+			})
+			return
+		}
+
+		// Notify the blocked caller
+		pending.ResultCh <- ApprovalResult{Approved: true, Error: nil}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"message": "Email sent successfully",
+		})
+	})
+
+	// API: Reject pending email
+	mux.HandleFunc("/api/reject/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		pathParts := strings.Split(r.URL.Path, "/")
+		if len(pathParts) < 4 {
+			http.Error(w, "Invalid URL", http.StatusBadRequest)
+			return
+		}
+		sessionID := pathParts[3]
+
+		if approvalSession == nil || approvalSession.ID != sessionID {
+			http.Error(w, "Invalid session", http.StatusForbidden)
+			return
+		}
+
+		pending, err := approvalSession.Reject()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		// Notify the blocked caller
+		pending.ResultCh <- ApprovalResult{Approved: false, Error: nil}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"message": "Email rejected",
+		})
+	})
+
+	// SSE: Real-time updates
+	mux.HandleFunc("/events/", func(w http.ResponseWriter, r *http.Request) {
+		pathParts := strings.Split(r.URL.Path, "/")
+		if len(pathParts) < 3 {
+			http.Error(w, "Invalid URL", http.StatusBadRequest)
+			return
+		}
+		sessionID := pathParts[2]
+
+		if approvalSession == nil || approvalSession.ID != sessionID {
+			http.Error(w, "Invalid session", http.StatusForbidden)
+			return
+		}
+
+		// Set SSE headers
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+
+		// Create channel for this client
+		clientCh := make(chan string, 10)
+		approvalSession.AddSSEClient(clientCh)
+		defer approvalSession.RemoveSSEClient(clientCh)
+
+		// Get the flusher
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "SSE not supported", http.StatusInternalServerError)
+			return
+		}
+
+		// Send initial event
+		fmt.Fprintf(w, "data: connected\n\n")
+		flusher.Flush()
+
+		// Listen for updates or client disconnect
+		for {
+			select {
+			case msg := <-clientCh:
+				fmt.Fprintf(w, "data: %s\n\n", msg)
+				flusher.Flush()
+			case <-r.Context().Done():
+				return
+			}
+		}
+	})
+
+	// Start server in goroutine
+	go func() {
+		addr := fmt.Sprintf(":%d", oobServerPort)
+		log.Printf("🌐 OOB Approval server starting on http://localhost%s", addr)
+		if err := http.ListenAndServe(addr, mux); err != nil {
+			log.Printf("OOB Server error: %v", err)
+		}
+	}()
+}
+
+// serveDashboard renders the approval dashboard HTML
+func serveDashboard(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+	tmpl := template.Must(template.New("dashboard").Parse(dashboardHTML))
+	tmpl.Execute(w, map[string]interface{}{
+		"SessionID": approvalSession.ID,
+		"Port":      oobServerPort,
+	})
+}
+
+// SendDraft sends a draft via Gmail API
+func (g *GmailServer) SendDraft(draftID string) error {
+	_, err := g.service.Users.Drafts.Send(g.userID, &gmail.Draft{Id: draftID}).Do()
+	if err != nil {
+		return fmt.Errorf("failed to send draft: %v", err)
+	}
+	return nil
+}
+
+// Dashboard HTML template
+const dashboardHTML = `<!DOCTYPE html>
+<html>
+<head>
+    <title>Gmail Outbox - Agent-Safe Review</title>
+    <meta charset="utf-8">
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        h1 {
+            color: #333;
+            border-bottom: 2px solid #4CAF50;
+            padding-bottom: 10px;
+        }
+        .status {
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        .status.waiting {
+            background: #e3f2fd;
+            border: 1px solid #90caf9;
+            color: #1565c0;
+        }
+        .status.pending {
+            background: #fff3e0;
+            border: 1px solid #ffcc80;
+            color: #e65100;
+        }
+        .email-card {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        .email-header {
+            border-bottom: 1px solid #eee;
+            padding-bottom: 15px;
+            margin-bottom: 15px;
+        }
+        .email-field {
+            margin-bottom: 8px;
+        }
+        .email-field label {
+            font-weight: 600;
+            color: #666;
+            display: inline-block;
+            width: 80px;
+        }
+        .email-body {
+            background: #fafafa;
+            border: 1px solid #eee;
+            border-radius: 4px;
+            padding: 15px;
+            white-space: pre-wrap;
+            font-family: inherit;
+            line-height: 1.5;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        .buttons {
+            display: flex;
+            gap: 15px;
+            margin-top: 20px;
+        }
+        button {
+            flex: 1;
+            padding: 15px 30px;
+            font-size: 16px;
+            font-weight: 600;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: transform 0.1s, box-shadow 0.1s;
+        }
+        button:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+        }
+        button:active {
+            transform: translateY(0);
+        }
+        .btn-approve {
+            background: #4CAF50;
+            color: white;
+        }
+        .btn-reject {
+            background: #f44336;
+            color: white;
+        }
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+        .history {
+            margin-top: 30px;
+        }
+        .history h2 {
+            color: #666;
+            font-size: 14px;
+            text-transform: uppercase;
+        }
+        .history-item {
+            padding: 10px;
+            border-bottom: 1px solid #eee;
+            font-size: 14px;
+        }
+        .history-item.sent { border-left: 3px solid #4CAF50; }
+        .history-item.rejected { border-left: 3px solid #f44336; }
+        .footer {
+            text-align: center;
+            color: #999;
+            font-size: 12px;
+            margin-top: 30px;
+        }
+        .pulse {
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+    </style>
+</head>
+<body>
+    <h1>📤 Gmail Outbox</h1>
+    <p style="color: #666;">Agent-Safe Review Dashboard</p>
+
+    <div id="status" class="status waiting">
+        <span class="pulse">⏳</span> Waiting for emails to review...
+    </div>
+
+    <div id="email-container" style="display: none;">
+        <div class="email-card">
+            <div class="email-header">
+                <div class="email-field">
+                    <label>To:</label>
+                    <span id="email-to"></span>
+                </div>
+                <div class="email-field">
+                    <label>Subject:</label>
+                    <span id="email-subject"></span>
+                </div>
+            </div>
+            <div class="email-body" id="email-body"></div>
+            <div class="buttons">
+                <button class="btn-approve" onclick="approve()" id="btn-approve">
+                    ✓ APPROVE & SEND
+                </button>
+                <button class="btn-reject" onclick="reject()" id="btn-reject">
+                    ✗ REJECT
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <div class="history" id="history-container" style="display: none;">
+        <h2>History</h2>
+        <div id="history-list"></div>
+    </div>
+
+    <div class="footer">
+        Session: {{.SessionID}}<br>
+        This dashboard is agent-inaccessible. Only you can approve emails.
+    </div>
+
+    <script>
+        const sessionID = "{{.SessionID}}";
+        const port = {{.Port}};
+        let currentPendingId = null;
+
+        // Connect to SSE for real-time updates
+        const evtSource = new EventSource("/events/" + sessionID);
+        evtSource.onmessage = function(event) {
+            console.log("SSE event:", event.data);
+            fetchPending();
+        };
+        evtSource.onerror = function(err) {
+            console.error("SSE error:", err);
+            // Fall back to polling
+            setInterval(fetchPending, 2000);
+        };
+
+        async function fetchPending() {
+            try {
+                const resp = await fetch("/api/pending/" + sessionID);
+                const data = await resp.json();
+
+                if (data.pending) {
+                    currentPendingId = data.id;
+                    document.getElementById("status").className = "status pending";
+                    document.getElementById("status").innerHTML =
+                        "<strong>⚠️ Email pending approval</strong>";
+                    document.getElementById("email-to").textContent = data.to;
+                    document.getElementById("email-subject").textContent = data.subject;
+                    document.getElementById("email-body").textContent = data.body;
+                    document.getElementById("email-container").style.display = "block";
+                    document.getElementById("btn-approve").disabled = false;
+                    document.getElementById("btn-reject").disabled = false;
+                } else {
+                    currentPendingId = null;
+                    document.getElementById("status").className = "status waiting";
+                    document.getElementById("status").innerHTML =
+                        '<span class="pulse">⏳</span> Waiting for emails to review...';
+                    document.getElementById("email-container").style.display = "none";
+                }
+            } catch (err) {
+                console.error("Error fetching pending:", err);
+            }
+        }
+
+        async function approve() {
+            if (!currentPendingId) return;
+
+            document.getElementById("btn-approve").disabled = true;
+            document.getElementById("btn-reject").disabled = true;
+            document.getElementById("btn-approve").textContent = "Sending...";
+
+            try {
+                const resp = await fetch("/api/approve/" + sessionID, { method: "POST" });
+                const data = await resp.json();
+
+                if (data.success) {
+                    document.getElementById("btn-approve").textContent = "✓ Sent!";
+                    addToHistory("sent",
+                        document.getElementById("email-to").textContent,
+                        document.getElementById("email-subject").textContent);
+                    setTimeout(fetchPending, 1000);
+                } else {
+                    alert("Failed to send: " + data.error);
+                    document.getElementById("btn-approve").textContent = "✓ APPROVE & SEND";
+                    document.getElementById("btn-approve").disabled = false;
+                    document.getElementById("btn-reject").disabled = false;
+                }
+            } catch (err) {
+                alert("Error: " + err);
+                document.getElementById("btn-approve").textContent = "✓ APPROVE & SEND";
+                document.getElementById("btn-approve").disabled = false;
+                document.getElementById("btn-reject").disabled = false;
+            }
+        }
+
+        async function reject() {
+            if (!currentPendingId) return;
+
+            document.getElementById("btn-approve").disabled = true;
+            document.getElementById("btn-reject").disabled = true;
+
+            try {
+                const resp = await fetch("/api/reject/" + sessionID, { method: "POST" });
+                const data = await resp.json();
+
+                if (data.success) {
+                    addToHistory("rejected",
+                        document.getElementById("email-to").textContent,
+                        document.getElementById("email-subject").textContent);
+                    fetchPending();
+                }
+            } catch (err) {
+                alert("Error: " + err);
+                document.getElementById("btn-approve").disabled = false;
+                document.getElementById("btn-reject").disabled = false;
+            }
+        }
+
+        function addToHistory(action, to, subject) {
+            const container = document.getElementById("history-container");
+            const list = document.getElementById("history-list");
+            container.style.display = "block";
+
+            const item = document.createElement("div");
+            item.className = "history-item " + action;
+            item.innerHTML = (action === "sent" ? "✓ Sent to " : "✗ Rejected: ") +
+                "<strong>" + escapeHtml(to) + "</strong> - " + escapeHtml(subject) +
+                " <span style='color:#999;font-size:12px;'>" + new Date().toLocaleTimeString() + "</span>";
+            list.insertBefore(item, list.firstChild);
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement("div");
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // Initial fetch
+        fetchPending();
+    </script>
+</body>
+</html>
+`
+
 func NewGmailServer() (*GmailServer, error) {
 	ctx := context.Background()
 
 	// Get credentials from separate environment variables
 	clientID := os.Getenv("GMAIL_CLIENT_ID")
 	clientSecret := os.Getenv("GMAIL_CLIENT_SECRET")
-	
+
 	if clientID == "" {
 		return nil, fmt.Errorf("GMAIL_CLIENT_ID environment variable not set")
 	}
@@ -81,7 +795,7 @@ func NewGmailServer() (*GmailServer, error) {
 // getToken retrieves a token from a local file or initiates OAuth flow
 func getToken(config *oauth2.Config) (*oauth2.Token, error) {
 	tokenFile := getAppFilePath("token.json")
-	
+
 	// Try to load existing token
 	token, err := tokenFromFile(tokenFile)
 	if err != nil {
@@ -109,7 +823,7 @@ func isTokenValid(token *oauth2.Token) bool {
 		Endpoint:     google.Endpoint,
 		Scopes:       []string{gmail.GmailReadonlyScope, gmail.GmailComposeScope},
 	}
-	
+
 	client := config.Client(context.Background(), token)
 	service, err := gmail.NewService(context.Background(), googleOption.WithHTTPClient(client))
 	if err != nil {
@@ -127,7 +841,7 @@ func performOAuthFlow(config *oauth2.Config, tokenFile string) (*oauth2.Token, e
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Save token for next time
 	saveToken(tokenFile, token)
 	return token, nil
@@ -141,7 +855,7 @@ func getTokenFromWeb(config *oauth2.Config) (*oauth2.Token, error) {
 
 	// Start a temporary HTTP server to catch the OAuth callback
 	server := &http.Server{Addr: ":8080"}
-	
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		code := r.URL.Query().Get("code")
 		if code == "" {
@@ -166,7 +880,7 @@ func getTokenFromWeb(config *oauth2.Config) (*oauth2.Token, error) {
     <p>Your Gmail MCP Server is now configured.</p>
 </body>
 </html>`)
-		
+
 		// Send the code back to the main flow
 		codeChan <- code
 	})
@@ -183,13 +897,13 @@ func getTokenFromWeb(config *oauth2.Config) (*oauth2.Token, error) {
 
 	// Update the redirect URI to point to our local server
 	config.RedirectURL = "http://localhost:8080"
-	
+
 	// Generate the authorization URL
 	authURL := config.AuthCodeURL("state-token", oauth2.AccessTypeOffline)
-	
+
 	fmt.Println("Opening browser for authorization...")
 	fmt.Printf("If browser doesn't open automatically, go to: %v\n", authURL)
-	
+
 	// Try to open browser automatically
 	openBrowser(authURL)
 
@@ -214,7 +928,7 @@ func getTokenFromWeb(config *oauth2.Config) (*oauth2.Token, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unable to retrieve token from web: %v", err)
 	}
-	
+
 	fmt.Println("✅ Authorization successful! Token saved.")
 	return token, nil
 }
@@ -232,7 +946,7 @@ func openBrowser(url string) {
 	default:
 		err = fmt.Errorf("unsupported platform")
 	}
-	
+
 	if err != nil {
 		fmt.Printf("Could not open browser automatically: %v\n", err)
 	}
@@ -245,7 +959,7 @@ func tokenFromFile(file string) (*oauth2.Token, error) {
 		return nil, err
 	}
 	defer f.Close()
-	
+
 	token := &oauth2.Token{}
 	err = json.NewDecoder(f).Decode(token)
 	return token, err
@@ -347,13 +1061,13 @@ func (g *GmailServer) SearchThreads(ctx context.Context, query string, maxResult
 // getThreadDrafts retrieves existing drafts for a specific thread
 func (g *GmailServer) getThreadDrafts(threadID string) ([]map[string]interface{}, error) {
 	var drafts []map[string]interface{}
-	
+
 	// List all drafts for the user
 	draftsList, err := g.service.Users.Drafts.List(g.userID).Do()
 	if err != nil {
 		return drafts, fmt.Errorf("failed to list drafts: %v", err)
 	}
-	
+
 	// Check each draft to see if it belongs to this thread
 	for _, draft := range draftsList.Drafts {
 		// Get the full draft details
@@ -361,14 +1075,14 @@ func (g *GmailServer) getThreadDrafts(threadID string) ([]map[string]interface{}
 		if err != nil {
 			continue // Skip drafts we can't access
 		}
-		
+
 		// Check if this draft belongs to the specified thread
 		if fullDraft.Message != nil && fullDraft.Message.ThreadId == threadID {
 			draftInfo := map[string]interface{}{
 				"draftId":  fullDraft.Id,
 				"threadId": fullDraft.Message.ThreadId,
 			}
-			
+
 			// Extract subject and snippet if available
 			if fullDraft.Message.Payload != nil {
 				for _, header := range fullDraft.Message.Payload.Headers {
@@ -377,7 +1091,7 @@ func (g *GmailServer) getThreadDrafts(threadID string) ([]map[string]interface{}
 						break
 					}
 				}
-				
+
 				// Extract draft body/snippet
 				if body := extractEmailBody(fullDraft.Message); body != "" {
 					// Truncate to snippet length
@@ -388,37 +1102,37 @@ func (g *GmailServer) getThreadDrafts(threadID string) ([]map[string]interface{}
 					draftInfo["snippet"] = snippet
 				}
 			}
-			
+
 			drafts = append(drafts, draftInfo)
 		}
 	}
-	
+
 	return drafts, nil
 }
 
 // CreateDraft creates a Gmail draft or updates existing draft if one exists for the thread
 func (g *GmailServer) CreateDraft(ctx context.Context, to, subject, body string, threadID string) (*mcp.CallToolResult, error) {
 	var message gmail.Message
-	
+
 	// Build the email message
 	headers := fmt.Sprintf("To: %s\r\n", to)
-	
+
 	if threadID != "" {
 		// Set the thread ID on the message for proper threading
 		message.ThreadId = threadID
-		
+
 		// Ensure subject has "Re:" prefix for replies
 		if !strings.HasPrefix(strings.ToLower(subject), "re:") {
 			subject = "Re: " + subject
 		}
-		
+
 		// For replies, we need to set the In-Reply-To and References headers
 		thread, err := g.service.Users.Threads.Get(g.userID, threadID).Do()
 		if err == nil && len(thread.Messages) > 0 {
 			lastMessage := thread.Messages[len(thread.Messages)-1]
 			var messageID string
 			var references string
-			
+
 			// Extract Message-ID and References from the last message
 			for _, header := range lastMessage.Payload.Headers {
 				switch header.Name {
@@ -428,10 +1142,10 @@ func (g *GmailServer) CreateDraft(ctx context.Context, to, subject, body string,
 					references = header.Value
 				}
 			}
-			
+
 			if messageID != "" {
 				headers += fmt.Sprintf("In-Reply-To: %s\r\n", messageID)
-				
+
 				// Build References header (previous references + last message ID)
 				if references != "" {
 					headers += fmt.Sprintf("References: %s %s\r\n", references, messageID)
@@ -440,27 +1154,27 @@ func (g *GmailServer) CreateDraft(ctx context.Context, to, subject, body string,
 				}
 			}
 		}
-		
+
 		// Check for existing drafts in this thread and update if found
 		existingDrafts, err := g.getThreadDrafts(threadID)
 		if err == nil && len(existingDrafts) > 0 {
 			// Assume only one draft per thread (as requested)
 			existingDraftID := existingDrafts[0]["draftId"].(string)
-			
+
 			headers += fmt.Sprintf("Subject: %s\r\n", subject)
 			rawMessage := headers + "\r\n" + body
 			message.Raw = base64.URLEncoding.EncodeToString([]byte(rawMessage))
-			
+
 			draft := &gmail.Draft{
-				Id: existingDraftID,
+				Id:      existingDraftID,
 				Message: &message,
 			}
-			
+
 			updatedDraft, err := g.service.Users.Drafts.Update(g.userID, existingDraftID, draft).Do()
 			if err != nil {
 				return mcp.NewToolResultError(fmt.Sprintf("Failed to update existing draft: %v", err)), nil
 			}
-			
+
 			result := map[string]interface{}{
 				"draftId": updatedDraft.Id,
 				"message": "Draft updated successfully (existing draft was overwritten)",
@@ -468,16 +1182,16 @@ func (g *GmailServer) CreateDraft(ctx context.Context, to, subject, body string,
 				"to":      to,
 				"subject": subject,
 			}
-			
+
 			resultJSON, _ := json.MarshalIndent(result, "", "  ")
 			return mcp.NewToolResultText(string(resultJSON)), nil
 		}
 	}
-	
+
 	// No existing draft found or no thread ID, create new draft
 	headers += fmt.Sprintf("Subject: %s\r\n", subject)
 	rawMessage := headers + "\r\n" + body
-	
+
 	// Gmail API requires base64url-encoded raw message
 	message.Raw = base64.URLEncoding.EncodeToString([]byte(rawMessage))
 
@@ -552,7 +1266,7 @@ func GeneratePersonalEmailStyleGuide(gmailServer *GmailServer) error {
 		body := extractEmailBody(fullMsg)
 		if body != "" && len(body) > 50 { // Only include substantial emails
 			emailBodies = append(emailBodies, body)
-			
+
 			// Extract headers for additional context
 			headers := make(map[string]string)
 			if fullMsg.Payload != nil {
@@ -592,7 +1306,7 @@ func GeneratePersonalEmailStyleGuide(gmailServer *GmailServer) error {
 		sample += fmt.Sprintf("Body: %s", body)
 		emailSamples = append(emailSamples, sample)
 	}
-	
+
 	samplesText := strings.Join(emailSamples, "\n\n---\n\n")
 
 	// Concise, focused prompt that encourages specificity
@@ -625,7 +1339,7 @@ Start with "# Personal Email Style Guide for %s"`, len(emailBodies), profile.Ema
 				},
 			},
 		},
-		Model: shared.ChatModelGPT4o,
+		Model:       shared.ChatModelGPT4o,
 		Temperature: openai.Float(0.3), // Lower temperature for more focused, consistent output
 	})
 	if err != nil {
@@ -747,21 +1461,21 @@ func extractTextAndLinksFromHTML(htmlContent string) string {
 		// Fallback to returning the HTML as-is if conversion fails
 		return htmlContent
 	}
-	
+
 	return strings.TrimSpace(markdown)
 }
 
 // extractAttachmentInfo extracts attachment information from a Gmail message
 func extractAttachmentInfo(message *gmail.Message) []map[string]interface{} {
 	var attachments []map[string]interface{}
-	
+
 	if message.Payload == nil {
 		return attachments
 	}
-	
+
 	// Check payload parts for attachments
 	extractAttachmentsFromParts(message.Payload.Parts, &attachments)
-	
+
 	return attachments
 }
 
@@ -774,22 +1488,22 @@ func extractAttachmentsFromParts(parts []*gmail.MessagePart, attachments *[]map[
 			if filename == "" {
 				filename = "unnamed_attachment"
 			}
-			
+
 			attachment := map[string]interface{}{
 				"attachmentId": part.Body.AttachmentId,
 				"filename":     filename,
 				"mimeType":     part.MimeType,
 				"size":         part.Body.Size,
 			}
-			
+
 			// Mark if this is a document we can extract text from
 			if isExtractableDocument(part.MimeType, filename) {
 				attachment["extractable"] = true
 			}
-			
+
 			*attachments = append(*attachments, attachment)
 		}
-		
+
 		// Recursively check nested parts
 		if len(part.Parts) > 0 {
 			extractAttachmentsFromParts(part.Parts, attachments)
@@ -808,12 +1522,12 @@ func isExtractableDocument(mimeType, filename string) bool {
 	case "text/plain":
 		return true
 	}
-	
+
 	// Check file extension as fallback
 	lowerFilename := strings.ToLower(filename)
 	return strings.HasSuffix(lowerFilename, ".pdf") ||
-		   strings.HasSuffix(lowerFilename, ".docx") ||
-		   strings.HasSuffix(lowerFilename, ".txt")
+		strings.HasSuffix(lowerFilename, ".docx") ||
+		strings.HasSuffix(lowerFilename, ".txt")
 }
 
 // ExtractAttachmentText safely extracts text content from an email attachment
@@ -823,7 +1537,7 @@ func (g *GmailServer) ExtractAttachmentText(ctx context.Context, messageID, atta
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to get message: %v", err)), nil
 	}
-	
+
 	// Debug: Print all attachment IDs found in this message
 	log.Printf("Looking for attachment ID: %s", attachmentID)
 	allAttachments := extractAttachmentInfo(message)
@@ -831,33 +1545,33 @@ func (g *GmailServer) ExtractAttachmentText(ctx context.Context, messageID, atta
 	for i, att := range allAttachments {
 		log.Printf("  Attachment %d: ID=%v, filename=%v", i, att["attachmentId"], att["filename"])
 	}
-	
+
 	// Find the attachment part to get metadata
 	var attachmentPart *gmail.MessagePart
 	findAttachmentPart(message.Payload.Parts, attachmentID, &attachmentPart)
-	
+
 	if attachmentPart == nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Attachment not found in message. Available attachments: %v", allAttachments)), nil
 	}
-	
+
 	// Get the attachment data
 	attachment, err := g.service.Users.Messages.Attachments.Get(g.userID, messageID, attachmentID).Do()
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to get attachment: %v", err)), nil
 	}
-	
+
 	// Decode the attachment data
 	data, err := base64.URLEncoding.DecodeString(attachment.Data)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to decode attachment data: %v", err)), nil
 	}
-	
+
 	// Extract text based on MIME type
 	text, err := extractTextFromBytes(data, attachmentPart.MimeType, attachmentPart.Filename)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to extract text: %v", err)), nil
 	}
-	
+
 	result := map[string]interface{}{
 		"messageId":    messageID,
 		"attachmentId": attachmentID,
@@ -866,7 +1580,7 @@ func (g *GmailServer) ExtractAttachmentText(ctx context.Context, messageID, atta
 		"textContent":  text,
 		"extractedAt":  time.Now().Format(time.RFC3339),
 	}
-	
+
 	resultJSON, _ := json.MarshalIndent(result, "", "  ")
 	return mcp.NewToolResultText(string(resultJSON)), nil
 }
@@ -910,49 +1624,49 @@ func extractTextFromBytes(data []byte, mimeType, filename string) (string, error
 // extractPDFText safely extracts text from PDF bytes
 func extractPDFText(data []byte) (string, error) {
 	reader := bytes.NewReader(data)
-	
+
 	// Open PDF reader
 	pdfReader, err := pdf.NewReader(reader, int64(len(data)))
 	if err != nil {
 		return "", fmt.Errorf("failed to open PDF: %v", err)
 	}
-	
+
 	var textContent strings.Builder
 	numPages := pdfReader.NumPage()
-	
+
 	// Limit to first 50 pages to avoid excessive processing
 	maxPages := numPages
 	if maxPages > 50 {
 		maxPages = 50
 	}
-	
+
 	for i := 1; i <= maxPages; i++ {
 		page := pdfReader.Page(i)
 		if page.V.IsNull() {
 			continue
 		}
-		
+
 		// Extract text with empty font map (safe extraction)
 		text, err := page.GetPlainText(map[string]*pdf.Font{})
 		if err != nil {
 			// Continue with other pages if one fails
 			continue
 		}
-		
+
 		textContent.WriteString(text)
 		textContent.WriteString("\n\n")
 	}
-	
+
 	extractedText := textContent.String()
 	if len(extractedText) == 0 {
 		return "", fmt.Errorf("no text could be extracted from PDF")
 	}
-	
+
 	// Add truncation notice if we hit the page limit
 	if numPages > 50 {
 		extractedText += fmt.Sprintf("\n\n[Note: PDF has %d pages total, but only first 50 pages were processed for safety]", numPages)
 	}
-	
+
 	return extractedText, nil
 }
 
@@ -965,25 +1679,25 @@ func extractDOCXText(data []byte) (string, error) {
 	}
 	defer os.Remove(tempFile.Name())
 	defer tempFile.Close()
-	
+
 	// Write data to temp file
 	if _, err := tempFile.Write(data); err != nil {
 		return "", fmt.Errorf("failed to write temp file: %v", err)
 	}
 	tempFile.Close()
-	
+
 	// Read DOCX from the temporary file
 	doc, err := docx.ReadDocxFile(tempFile.Name())
 	if err != nil {
 		return "", fmt.Errorf("failed to open DOCX: %v", err)
 	}
-	
+
 	// Get the raw content (which may be XML)
 	rawContent := doc.Editable().GetContent()
 	if len(rawContent) == 0 {
 		return "", fmt.Errorf("no text could be extracted from DOCX")
 	}
-	
+
 	// Try to extract plain text from XML if the content looks like XML
 	if strings.HasPrefix(strings.TrimSpace(rawContent), "<?xml") || strings.HasPrefix(strings.TrimSpace(rawContent), "<") {
 		plainText := extractTextFromXML(rawContent)
@@ -992,27 +1706,27 @@ func extractDOCXText(data []byte) (string, error) {
 		}
 		// If XML parsing fails, fall back to raw content
 	}
-	
+
 	return rawContent, nil
 }
 
 // extractTextFromXML extracts plain text content from DOCX XML
 func extractTextFromXML(xmlContent string) string {
 	var textParts []string
-	
+
 	// Create a decoder for the XML content
 	decoder := xml.NewDecoder(strings.NewReader(xmlContent))
-	
+
 	// Track if we're inside a <w:t> element
 	var insideTextElement bool
-	
+
 	for {
 		// Read the next token
 		token, err := decoder.Token()
 		if err != nil {
 			break // End of document or error
 		}
-		
+
 		switch t := token.(type) {
 		case xml.StartElement:
 			// Check if this is a text element
@@ -1034,10 +1748,10 @@ func extractTextFromXML(xmlContent string) string {
 			}
 		}
 	}
-	
+
 	// Join all text parts with spaces and clean up
 	result := strings.Join(textParts, " ")
-	
+
 	// Clean up extra whitespace while preserving meaningful breaks
 	// Split by multiple spaces and rejoin with single spaces
 	words := strings.Fields(result)
@@ -1047,7 +1761,7 @@ func extractTextFromXML(xmlContent string) string {
 // getAppDataDir returns the application data directory
 func getAppDataDir() string {
 	var appDataDir string
-	
+
 	if runtime.GOOS == "windows" {
 		// Windows: %APPDATA%\auto-gmail
 		appDataDir = filepath.Join(os.Getenv("APPDATA"), "auto-gmail")
@@ -1060,13 +1774,13 @@ func getAppDataDir() string {
 		}
 		appDataDir = filepath.Join(homeDir, ".auto-gmail")
 	}
-	
+
 	// Ensure the directory exists
 	if err := os.MkdirAll(appDataDir, 0755); err != nil {
 		log.Printf("Warning: Could not create app data directory: %v", err)
 		return "."
 	}
-	
+
 	return appDataDir
 }
 
@@ -1078,23 +1792,23 @@ func getAppFilePath(filename string) string {
 // ensureStyleGuideExists checks if the style guide exists and auto-generates it if needed
 func ensureStyleGuideExists(gmailServer *GmailServer) error {
 	toneFilePath := getAppFilePath("personal-email-style-guide.md")
-	
+
 	// Check if file already exists
 	if _, err := os.Stat(toneFilePath); err == nil {
 		return nil // File exists, nothing to do
 	}
-	
+
 	// File doesn't exist, try to auto-generate
 	apiKey := os.Getenv("OPENAI_API_KEY")
 	if apiKey == "" {
 		return fmt.Errorf("personal email style guide not found at %s and OPENAI_API_KEY not set. Please either set OPENAI_API_KEY for auto-generation or create the file manually", toneFilePath)
 	}
-	
+
 	log.Println("📝 Style guide not found, auto-generating from your sent emails...")
 	if err := GeneratePersonalEmailStyleGuide(gmailServer); err != nil {
 		return fmt.Errorf("personal email style guide not found at %s and auto-generation failed: %v. Please create the file manually or set OPENAI_API_KEY", toneFilePath, err)
 	}
-	
+
 	log.Println("✅ Personal email style guide auto-generated successfully!")
 	return nil
 }
@@ -1103,7 +1817,7 @@ func main() {
 	// Parse command line arguments for transport mode
 	var useHTTP = false
 	var port = "8080"
-	
+
 	if len(os.Args) > 1 {
 		if os.Args[1] == "--http" {
 			useHTTP = true
@@ -1134,6 +1848,28 @@ func main() {
 	if err := ensureStyleGuideExists(gmailServer); err != nil {
 		log.Printf("⚠️  %v", err)
 	}
+
+	// Initialize OOB approval session (Agent Cut-Out Pattern)
+	approvalSession, err = NewApprovalSession()
+	if err != nil {
+		log.Fatalf("Failed to create approval session: %v", err)
+	}
+
+	// Start the OOB approval web server
+	StartOOBServer(gmailServer)
+
+	// Print the dashboard URL prominently
+	log.Println("")
+	log.Println("═══════════════════════════════════════════════════════════════")
+	log.Println("📤 OOB APPROVAL DASHBOARD (Agent Cut-Out Pattern)")
+	log.Println("═══════════════════════════════════════════════════════════════")
+	log.Printf("   http://localhost:%d/outbox/%s", oobServerPort, approvalSession.ID)
+	log.Println("")
+	log.Println("   Open this URL in your browser to approve outgoing emails.")
+	log.Println("   The agent CANNOT see or influence this approval process.")
+	log.Println("   Keep this tab open while working with your AI assistant.")
+	log.Println("═══════════════════════════════════════════════════════════════")
+	log.Println("")
 
 	// Create MCP server
 	mcpServer := server.NewMCPServer(
@@ -1175,7 +1911,7 @@ func main() {
 		return []mcp.ResourceContents{
 			mcp.TextResourceContents{
 				URI:      "file://personal-email-style-guide",
-				MIMEType: "text/markdown", 
+				MIMEType: "text/markdown",
 				Text:     string(content),
 			},
 		}, nil
@@ -1234,18 +1970,18 @@ func main() {
 		// Check file statuses
 		tokenPath := getAppFilePath("token.json")
 		tonePath := getAppFilePath("personal-email-style-guide.md")
-		
+
 		tokenExists := "❌ Not found"
 		if _, err := os.Stat(tokenPath); err == nil {
 			tokenExists = "✅ Found"
 		}
-		
+
 		toneExists := "❌ Not found"
 		if _, err := os.Stat(tonePath); err == nil {
 			toneExists = "✅ Found"
 		}
 
-		statusMessage := fmt.Sprintf("📊 **Gmail MCP Server Status**\n\n📁 **App Data Directory:** %s\n\n🔑 **Token File:** %s\n   Status: %s\n\n📝 **Style Guide File:** %s\n   Status: %s\n\n🛠️ **Available Commands:**\n- Use /generate-email-tone to create email tone personalization\n- Use tools: search_threads (includes drafts), create_draft (create/update), extract_attachment_by_filename\n- Use resource: file://personal-email-style-guide", 
+		statusMessage := fmt.Sprintf("📊 **Gmail MCP Server Status**\n\n📁 **App Data Directory:** %s\n\n🔑 **Token File:** %s\n   Status: %s\n\n📝 **Style Guide File:** %s\n   Status: %s\n\n🛠️ **Available Commands:**\n- Use /generate-email-tone to create email tone personalization\n- Use tools: search_threads (includes drafts), create_draft (create/update), extract_attachment_by_filename\n- Use resource: file://personal-email-style-guide",
 			getAppDataDir(), tokenPath, tokenExists, tonePath, toneExists)
 
 		return &mcp.GetPromptResult{
@@ -1474,26 +2210,133 @@ EXAMPLE QUERIES:
 		return gmailServer.FetchEmailBodies(ctx, threadIDs)
 	})
 
+	// Add Send Draft tool with OOB approval (Agent Cut-Out Pattern)
+	sendDraftTool := mcp.NewTool("send_draft",
+		mcp.WithDescription(`Submit a draft email for user approval and sending.
+
+⚠️  IMPORTANT: This tool implements the Agent Cut-Out security pattern.
+
+How it works:
+1. You call this tool with a draft_id
+2. The email content is displayed on a SEPARATE web dashboard that you cannot see or influence
+3. The user reviews the ACTUAL email content (not what you might claim it contains)
+4. The user clicks Approve or Reject in their browser
+5. This call BLOCKS until the user decides
+6. The SERVER sends the email directly (you never touch it)
+
+You will receive one of:
+- {status: "sent"} - User approved, email was sent
+- {status: "rejected"} - User rejected the email
+- {status: "error", message: "..."} - Something went wrong
+
+This ensures you cannot:
+- Misrepresent the email content to the user
+- Send emails without genuine human approval
+- Modify the email after showing it to the user`),
+		mcp.WithString("draft_id",
+			mcp.Required(),
+			mcp.Description("The Gmail draft ID to submit for approval and sending"),
+		),
+	)
+
+	mcpServer.AddTool(sendDraftTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		draftID, err := req.RequireString("draft_id")
+		if err != nil {
+			return mcp.NewToolResultError("draft_id parameter is required"), nil
+		}
+
+		// Check if approval session exists
+		if approvalSession == nil {
+			return mcp.NewToolResultError("Approval session not initialized. The OOB dashboard must be running."), nil
+		}
+
+		// Fetch the draft to get its content
+		draft, err := gmailServer.service.Users.Drafts.Get(gmailServer.userID, draftID).Do()
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to get draft: %v", err)), nil
+		}
+
+		// Extract email details from the draft
+		var to, subject, body string
+		if draft.Message != nil && draft.Message.Payload != nil {
+			for _, header := range draft.Message.Payload.Headers {
+				switch header.Name {
+				case "To":
+					to = header.Value
+				case "Subject":
+					subject = header.Value
+				}
+			}
+			body = extractEmailBody(draft.Message)
+		}
+
+		if to == "" {
+			return mcp.NewToolResultError("Draft has no recipient (To field)"), nil
+		}
+
+		// Queue the email for approval
+		pending, err := approvalSession.QueueEmail(draftID, to, subject, body)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+
+		log.Printf("📧 Email queued for approval: to=%s subject=%s", to, subject)
+
+		// Block until user approves/rejects or timeout
+		select {
+		case result := <-pending.ResultCh:
+			if result.Error != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("Failed to send: %v", result.Error)), nil
+			}
+			if result.Approved {
+				resultJSON, _ := json.MarshalIndent(map[string]interface{}{
+					"status":  "sent",
+					"message": "Email approved and sent successfully",
+					"to":      to,
+					"subject": subject,
+				}, "", "  ")
+				return mcp.NewToolResultText(string(resultJSON)), nil
+			} else {
+				resultJSON, _ := json.MarshalIndent(map[string]interface{}{
+					"status":  "rejected",
+					"message": "User rejected the email",
+					"to":      to,
+					"subject": subject,
+				}, "", "  ")
+				return mcp.NewToolResultText(string(resultJSON)), nil
+			}
+
+		case <-time.After(5 * time.Minute):
+			// Timeout - remove from pending
+			approvalSession.mu.Lock()
+			if approvalSession.Pending != nil && approvalSession.Pending.ID == pending.ID {
+				approvalSession.Pending = nil
+			}
+			approvalSession.mu.Unlock()
+			return mcp.NewToolResultError("Approval timed out after 5 minutes. User did not respond."), nil
+		}
+	})
+
 	// Start the server
 	if useHTTP {
 		log.Printf("Starting Gmail MCP Server in HTTP mode on port %s...", port)
 		log.Printf("✅ Server will run persistently at http://localhost:%s", port)
 		log.Printf("   OAuth will only be required once at startup!")
 		log.Printf("   (Use Ctrl+C to stop the server)")
-		
+
 		// Run Gmail server authentication once at startup
 		log.Println("🔐 Authenticating with Gmail (one-time only)...")
-		
+
 		// Test Gmail connection to ensure OAuth is working
 		_, err := gmailServer.service.Users.GetProfile(gmailServer.userID).Do()
 		if err != nil {
 			log.Fatalf("Gmail authentication failed: %v", err)
 		}
 		log.Println("✅ Gmail authentication successful!")
-		
+
 		// Create HTTP server with CORS support for browser clients
 		mux := http.NewServeMux()
-		
+
 		// Add basic info endpoint
 		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/html")
@@ -1525,51 +2368,51 @@ EXAMPLE QUERIES:
 </body>
 </html>`, port, port)
 		})
-		
+
 		// Add health check endpoint
 		mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("Access-Control-Allow-Origin", "*")
-			
+
 			status := map[string]interface{}{
-				"status": "healthy",
-				"server": "Gmail MCP Server",
-				"version": "1.0.0",
-				"timestamp": time.Now().Format(time.RFC3339),
+				"status":              "healthy",
+				"server":              "Gmail MCP Server",
+				"version":             "1.0.0",
+				"timestamp":           time.Now().Format(time.RFC3339),
 				"gmail_authenticated": true,
 			}
-			
+
 			json.NewEncoder(w).Encode(status)
 		})
-		
+
 		// Add MCP endpoint (simplified HTTP-based MCP)
 		mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
 			// Enable CORS
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 			w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-			
+
 			if r.Method == "OPTIONS" {
 				w.WriteHeader(http.StatusOK)
 				return
 			}
-			
+
 			w.Header().Set("Content-Type", "application/json")
-			
+
 			// Simple implementation - for full MCP support, you'd need
 			// to implement the complete JSON-RPC protocol here
 			response := map[string]interface{}{
 				"jsonrpc": "2.0",
 				"result": map[string]interface{}{
-					"message": "Gmail MCP Server HTTP endpoint",
-					"note": "For full MCP support, use stdio mode. HTTP mode is experimental.",
+					"message":       "Gmail MCP Server HTTP endpoint",
+					"note":          "For full MCP support, use stdio mode. HTTP mode is experimental.",
 					"stdio_command": os.Args[0], // Path to this binary
 				},
 			}
-			
+
 			json.NewEncoder(w).Encode(response)
 		})
-		
+
 		log.Printf("🌐 HTTP server starting on http://localhost:%s", port)
 		log.Printf("📖 View server info: http://localhost:%s", port)
 		log.Printf("🔍 Health check: http://localhost:%s/health", port)
@@ -1578,13 +2421,13 @@ EXAMPLE QUERIES:
 		log.Printf("   1. For now, use stdio mode (recommended)")
 		log.Printf("   2. In Cursor MCP settings, use command: %s", os.Args[0])
 		log.Printf("   3. Or wait for full HTTP MCP transport support")
-		
+
 		// Start HTTP server
 		httpServer := &http.Server{
 			Addr:    ":" + port,
 			Handler: mux,
 		}
-		
+
 		if err := httpServer.ListenAndServe(); err != nil {
 			log.Fatalf("HTTP Server error: %v", err)
 		}
@@ -1592,7 +2435,7 @@ EXAMPLE QUERIES:
 		log.Println("Starting Gmail MCP Server in stdio mode...")
 		log.Println("✅ Server ready! Waiting for MCP client connections via stdio...")
 		log.Println("   (Use Ctrl+C to stop the server)")
-		
+
 		if err := server.ServeStdio(mcpServer); err != nil {
 			log.Fatalf("Server error: %v", err)
 		}
@@ -1607,14 +2450,14 @@ func (g *GmailServer) ExtractAttachmentByFilename(ctx context.Context, messageID
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to get message: %v", err)), nil
 	}
-	
+
 	// Find all attachments in the message
 	allAttachments := extractAttachmentInfo(message)
-	
+
 	// Look for the attachment with matching filename
 	var targetAttachment map[string]interface{}
 	var attachmentPart *gmail.MessagePart
-	
+
 	for _, attachment := range allAttachments {
 		if attachment["filename"] == filename {
 			targetAttachment = attachment
@@ -1623,7 +2466,7 @@ func (g *GmailServer) ExtractAttachmentByFilename(ctx context.Context, messageID
 			break
 		}
 	}
-	
+
 	if targetAttachment == nil {
 		availableFiles := make([]string, 0, len(allAttachments))
 		for _, att := range allAttachments {
@@ -1631,30 +2474,30 @@ func (g *GmailServer) ExtractAttachmentByFilename(ctx context.Context, messageID
 		}
 		return mcp.NewToolResultError(fmt.Sprintf("Attachment with filename '%s' not found. Available files: %v", filename, availableFiles)), nil
 	}
-	
+
 	if attachmentPart == nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Could not find attachment part for filename '%s'", filename)), nil
 	}
-	
+
 	// Get the attachment data using the current attachment ID
 	attachmentID := targetAttachment["attachmentId"].(string)
 	attachment, err := g.service.Users.Messages.Attachments.Get(g.userID, messageID, attachmentID).Do()
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to get attachment data: %v", err)), nil
 	}
-	
+
 	// Decode the attachment data
 	data, err := base64.URLEncoding.DecodeString(attachment.Data)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to decode attachment data: %v", err)), nil
 	}
-	
+
 	// Extract text based on MIME type
 	text, err := extractTextFromBytes(data, attachmentPart.MimeType, attachmentPart.Filename)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to extract text: %v", err)), nil
 	}
-	
+
 	result := map[string]interface{}{
 		"messageId":    messageID,
 		"filename":     filename,
@@ -1663,7 +2506,7 @@ func (g *GmailServer) ExtractAttachmentByFilename(ctx context.Context, messageID
 		"textContent":  text,
 		"extractedAt":  time.Now().Format(time.RFC3339),
 	}
-	
+
 	resultJSON, _ := json.MarshalIndent(result, "", "  ")
 	return mcp.NewToolResultText(string(resultJSON)), nil
 }
@@ -1671,7 +2514,7 @@ func (g *GmailServer) ExtractAttachmentByFilename(ctx context.Context, messageID
 // FetchEmailBodies fetches full email content for multiple threads
 func (g *GmailServer) FetchEmailBodies(ctx context.Context, threadIDs []string) (*mcp.CallToolResult, error) {
 	var results []map[string]interface{}
-	
+
 	for _, threadID := range threadIDs {
 		// Get thread details directly from Gmail API
 		threadDetail, err := g.service.Users.Threads.Get(g.userID, threadID).Do()
@@ -1700,7 +2543,7 @@ func (g *GmailServer) FetchEmailBodies(ctx context.Context, threadIDs []string) 
 
 		// Extract full email body content with markdown formatting
 		fullBody := extractEmailBody(firstMessage)
-		
+
 		// Limit full body to prevent overwhelming the context (8000 chars = ~2000 tokens)
 		if len(fullBody) > 8000 {
 			fullBody = fullBody[:8000] + "\n\n[Content truncated - email is longer than 8000 characters]"
@@ -1744,11 +2587,11 @@ func (g *GmailServer) FetchEmailBodies(ctx context.Context, threadIDs []string) 
 
 		results = append(results, threadResult)
 	}
-	
+
 	resultJSON, err := json.MarshalIndent(results, "", "  ")
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to marshal results: %v", err)), nil
 	}
-	
+
 	return mcp.NewToolResultText(string(resultJSON)), nil
 }
