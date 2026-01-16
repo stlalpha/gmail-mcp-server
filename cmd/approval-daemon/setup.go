@@ -59,7 +59,8 @@ func (s *SetupServer) run() error {
 
 func (s *SetupServer) handleSetup(w http.ResponseWriter, r *http.Request) {
 	// Generate QR code for ntfy topic subscription
-	ntfyURL := fmt.Sprintf("ntfy://%s", s.config.NtfyTopic)
+	// Use HTTPS URL so iOS Camera recognizes it and opens Safari -> ntfy app
+	ntfyURL := fmt.Sprintf("https://ntfy.sh/%s", s.config.NtfyTopic)
 	qr, err := qrcode.Encode(ntfyURL, qrcode.Medium, 256)
 	if err != nil {
 		http.Error(w, "Failed to generate QR code", 500)
@@ -143,10 +144,11 @@ const setupHTML = `<!DOCTYPE html>
     <div class="step">
         <span class="step-num">2</span>
         <strong>Subscribe to your private topic</strong>
-        <p>Scan this QR code with the ntfy app, or manually subscribe to:</p>
+        <p>Scan this QR code with your phone's camera. It will open ntfy.sh where you can subscribe.</p>
         <div class="qr-container">
             <img src="data:image/png;base64,{{.QRCode}}" alt="QR Code">
         </div>
+        <p style="margin-top: 10px; font-size: 14px; color: #666;">Or manually subscribe to this topic in the ntfy app:</p>
         <div class="topic">{{.Topic}}</div>
     </div>
 
