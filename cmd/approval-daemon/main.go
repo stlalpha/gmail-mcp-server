@@ -44,6 +44,41 @@ func getConfigPath() string {
 }
 
 func run() error {
-	log.Println("Approval daemon starting...")
-	return nil
+	config, err := loadConfig()
+	if err != nil {
+		return fmt.Errorf("failed to load config: %w", err)
+	}
+
+	// First run or reset - need setup
+	if config == nil || !config.SetupComplete {
+		if config == nil {
+			config, err = createNewConfig()
+			if err != nil {
+				return fmt.Errorf("failed to create config: %w", err)
+			}
+			if err := saveConfig(config); err != nil {
+				return fmt.Errorf("failed to save initial config: %w", err)
+			}
+		}
+
+		setupServer, err := newSetupServer(config)
+		if err != nil {
+			return fmt.Errorf("failed to create setup server: %w", err)
+		}
+		if err := setupServer.run(); err != nil {
+			return fmt.Errorf("setup failed: %w", err)
+		}
+
+		// Reload config after setup
+		config, err = loadConfig()
+		if err != nil {
+			return fmt.Errorf("failed to reload config: %w", err)
+		}
+	}
+
+	log.Println("Setup complete. Daemon ready.")
+	log.Printf("ntfy topic: %s", config.NtfyTopic)
+
+	// TODO: Start normal operation
+	select {} // Block forever for now
 }
