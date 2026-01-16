@@ -167,9 +167,9 @@ The server will create a style-guide file based on the last 25 emails you've sen
 - Ensures consistent personal style across all communications
 - Resource also available at `file://personal-email-style-guide`
 
-## 5. Secure Email Sending (Agent Cut-Out Pattern)
+## 5. Secure Email Sending (Mobile Push Approval)
 
-This server implements a security pattern called **Agent Cut-Out** that prevents AI agents from misrepresenting email content to users.
+This server implements a security pattern called **Agent Cut-Out** that prevents AI agents from misrepresenting email content to users. The agent cannot bypass approval - it happens on your phone via push notification.
 
 ### The Problem
 When an AI agent sends emails on your behalf, it could potentially:
@@ -177,46 +177,77 @@ When an AI agent sends emails on your behalf, it could potentially:
 - Manipulate you into approving emails through social engineering
 - Send emails without genuine human approval
 
-### The Solution: Out-of-Band (OOB) Approval
+### The Solution: Mobile Push Approval
 
-When the server starts, you'll see:
+A separate **approval daemon** runs independently from the MCP server. When the agent tries to send an email:
+1. The MCP server creates a draft and sends an approval request to the daemon
+2. The daemon sends a push notification to your phone via [ntfy.sh](https://ntfy.sh)
+3. You see the email preview on your phone and tap Approve or Reject
+4. The daemon notifies the MCP server, which sends (or discards) the email
 
+**Security Property**: The agent has no access to the daemon or its secrets. It cannot influence the approval process.
+
+### Setup
+
+1. **Build both binaries:**
+   ```bash
+   go build -o gmail-mcp-server .
+   go build -o gmail-approval-daemon ./cmd/approval-daemon
+   ```
+
+2. **Start the approval daemon (first time):**
+   ```bash
+   ./gmail-approval-daemon
+   ```
+   - Opens browser with setup page
+   - Install [ntfy app](https://ntfy.sh) on your phone
+   - Scan QR code to subscribe to your private topic
+   - Click "Send Test Notification" and verify you receive it
+   - Click "Complete Setup"
+
+3. **Start the MCP server:**
+   ```bash
+   ./gmail-mcp-server
+   ```
+
+### Daily Use
+
+1. Start the approval daemon: `./gmail-approval-daemon`
+2. Start the MCP server (in your agent config)
+3. When agent sends email, you get a push notification on your phone
+4. Tap Approve or Reject
+
+### Resetting
+
+To regenerate your ntfy topic (new phone, etc.):
+```bash
+./gmail-approval-daemon --reset
 ```
-═══════════════════════════════════════════════════════════════
-📤 OOB APPROVAL DASHBOARD (Agent Cut-Out Pattern)
-═══════════════════════════════════════════════════════════════
-   http://localhost:8787/outbox/x7k2m9p4q1w8e5r2t6y3u0i9
-
-   Open this URL in your browser to approve outgoing emails.
-   The agent CANNOT see or influence this approval process.
-   Keep this tab open while working with your AI assistant.
-═══════════════════════════════════════════════════════════════
-```
-
-### How It Works
-
-1. **Agent creates a draft** using `create_draft`
-2. **Agent calls `send_draft`** - this call BLOCKS
-3. **You see the ACTUAL email** on the web dashboard (not what the agent claims)
-4. **You click Approve or Reject** in your browser
-5. **Server sends the email** (if approved) and notifies the agent
 
 ### Security Properties
 
 | Property | Description |
 |----------|-------------|
 | **Agent-blind** | Agent cannot see or influence the approval UI |
+| **Process-isolated** | Daemon runs separately, agent has no access to its secrets |
 | **Server-executed** | Server sends the email, not the agent |
 | **One-at-a-time** | Only one email can be pending approval |
 | **Time-limited** | Pending emails expire after 5 minutes |
 | **Tamper-proof** | You see exactly what the server will send |
 
-### Usage
+### Fallback: Web Dashboard
 
-1. Start the MCP server
-2. Open the dashboard URL in your browser (keep it open)
-3. Work with your AI agent normally
-4. When the agent wants to send an email, review and approve/reject in the dashboard
+A web dashboard is also available for approving emails directly in your browser (without mobile push). When the MCP server starts, it shows:
+
+```
+═══════════════════════════════════════════════════════════════
+📤 OOB APPROVAL DASHBOARD (Agent Cut-Out Pattern)
+═══════════════════════════════════════════════════════════════
+   http://localhost:8787/outbox/...
+
+   Open this URL in your browser to view/approve outgoing emails.
+═══════════════════════════════════════════════════════════════
+```
 
 See `docs/agent-cut-out-pattern.md` for the full security pattern documentation.
 
