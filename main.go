@@ -33,8 +33,7 @@ import (
 	"google.golang.org/api/gmail/v1"
 	googleOption "google.golang.org/api/option"
 
-	"github.com/pquerna/otp"
-	"github.com/pquerna/otp/totp"
+	"net"
 )
 
 type GmailServer struct {
@@ -72,7 +71,6 @@ type ApprovalSession struct {
 	History    []EmailHistoryEntry
 	mu         sync.Mutex
 	sseClients map[chan string]bool // SSE clients for real-time updates
-	TOTPKey    *otp.Key             // TOTP key for second-factor approval
 }
 
 // EmailHistoryEntry records sent/rejected emails
@@ -87,7 +85,7 @@ type EmailHistoryEntry struct {
 // Global approval session (created on server start)
 var approvalSession *ApprovalSession
 
-// NewApprovalSession creates a new session with a crypto-random ID and TOTP key
+// NewApprovalSession creates a new session with a crypto-random ID
 func NewApprovalSession() (*ApprovalSession, error) {
 	// Generate 32 bytes of randomness for session ID
 	randomBytes := make([]byte, 32)
@@ -99,23 +97,41 @@ func NewApprovalSession() (*ApprovalSession, error) {
 	// Remove padding for cleaner URLs
 	sessionID = strings.TrimRight(sessionID, "=")
 
-	// Generate TOTP key for second-factor approval
-	totpKey, err := totp.Generate(totp.GenerateOpts{
-		Issuer:      "Gmail-MCP-Server",
-		AccountName: "outbox-approval",
-		SecretSize:  32,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate TOTP key: %v", err)
-	}
-
 	return &ApprovalSession{
 		ID:         sessionID,
 		CreatedAt:  time.Now(),
 		History:    make([]EmailHistoryEntry, 0),
 		sseClients: make(map[chan string]bool),
-		TOTPKey:    totpKey,
 	}, nil
+}
+
+// sendToDaemon sends a request to the approval daemon via Unix socket
+func sendToDaemon(req map[string]string) (map[string]interface{}, error) {
+	home, _ := os.UserHomeDir()
+	socketPath := filepath.Join(home, ".config", "gmail-mcp", "approval.sock")
+
+	conn, err := net.Dial("unix", socketPath)
+	if err != nil {
+		return nil, fmt.Errorf("approval daemon not running. Start it with: gmail-approval-daemon")
+	}
+	defer conn.Close()
+
+	// Set deadline for the entire operation (5 min approval timeout + buffer)
+	conn.SetDeadline(time.Now().Add(6 * time.Minute))
+
+	encoder := json.NewEncoder(conn)
+	decoder := json.NewDecoder(conn)
+
+	if err := encoder.Encode(req); err != nil {
+		return nil, fmt.Errorf("failed to send request to daemon: %w", err)
+	}
+
+	var resp map[string]interface{}
+	if err := decoder.Decode(&resp); err != nil {
+		return nil, fmt.Errorf("failed to read daemon response: %w", err)
+	}
+
+	return resp, nil
 }
 
 // QueueEmail queues an email for approval, returns error if one is already pending
@@ -322,31 +338,7 @@ func StartOOBServer(gmailServer *GmailServer) {
 			return
 		}
 
-		// Parse TOTP code from request body
-		var reqBody struct {
-			TOTP string `json:"totp"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"success": false,
-				"error":   "Invalid request body",
-			})
-			return
-		}
-
-		// Validate TOTP code
-		if !totp.Validate(reqBody.TOTP, approvalSession.TOTPKey.Secret()) {
-			log.Printf("🚫 TOTP validation failed for code: %s", reqBody.TOTP)
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"success": false,
-				"error":   "Invalid TOTP code. Please check your authenticator app and try again.",
-			})
-			return
-		}
-
-		log.Printf("✅ TOTP validated successfully")
+		log.Printf("✅ Email approved via dashboard")
 
 		pending, err := approvalSession.Approve()
 		if err != nil {
@@ -594,39 +586,6 @@ const dashboardHTML = `<!DOCTYPE html>
             transform: none;
             box-shadow: none;
         }
-        .totp-section {
-            margin-top: 20px;
-            padding: 15px;
-            background: #e8f5e9;
-            border: 1px solid #a5d6a7;
-            border-radius: 8px;
-        }
-        .totp-section label {
-            display: block;
-            font-weight: 600;
-            margin-bottom: 8px;
-            color: #2e7d32;
-        }
-        .totp-input {
-            width: 150px;
-            padding: 12px;
-            font-size: 24px;
-            font-family: monospace;
-            text-align: center;
-            letter-spacing: 8px;
-            border: 2px solid #a5d6a7;
-            border-radius: 8px;
-            outline: none;
-        }
-        .totp-input:focus {
-            border-color: #4CAF50;
-            box-shadow: 0 0 0 3px rgba(76, 175, 80, 0.2);
-        }
-        .totp-hint {
-            font-size: 12px;
-            color: #666;
-            margin-top: 8px;
-        }
         .history {
             margin-top: 30px;
         }
@@ -678,11 +637,6 @@ const dashboardHTML = `<!DOCTYPE html>
                 </div>
             </div>
             <div class="email-body" id="email-body"></div>
-            <div class="totp-section">
-                <label>🔐 Enter TOTP Code to Approve:</label>
-                <input type="text" id="totp-code" class="totp-input" maxlength="6" pattern="[0-9]*" inputmode="numeric" placeholder="000000" autocomplete="off">
-                <div class="totp-hint">Enter the 6-digit code from your authenticator app</div>
-            </div>
             <div class="buttons">
                 <button class="btn-approve" onclick="approve()" id="btn-approve">
                     ✓ APPROVE & SEND
@@ -737,9 +691,6 @@ const dashboardHTML = `<!DOCTYPE html>
                     document.getElementById("email-container").style.display = "block";
                     document.getElementById("btn-approve").disabled = false;
                     document.getElementById("btn-reject").disabled = false;
-                    document.getElementById("totp-code").disabled = false;
-                    document.getElementById("totp-code").value = "";
-                    document.getElementById("totp-code").focus();
                 } else {
                     currentPendingId = null;
                     document.getElementById("status").className = "status waiting";
@@ -755,29 +706,20 @@ const dashboardHTML = `<!DOCTYPE html>
         async function approve() {
             if (!currentPendingId) return;
 
-            const totpCode = document.getElementById("totp-code").value.trim();
-            if (!totpCode || totpCode.length !== 6) {
-                alert("Please enter a valid 6-digit TOTP code");
-                document.getElementById("totp-code").focus();
-                return;
-            }
-
             document.getElementById("btn-approve").disabled = true;
             document.getElementById("btn-reject").disabled = true;
-            document.getElementById("totp-code").disabled = true;
             document.getElementById("btn-approve").textContent = "Sending...";
 
             try {
                 const resp = await fetch("/api/approve/" + sessionID, {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ totp: totpCode })
+                    body: JSON.stringify({})
                 });
                 const data = await resp.json();
 
                 if (data.success) {
                     document.getElementById("btn-approve").textContent = "✓ Sent!";
-                    document.getElementById("totp-code").value = "";
                     addToHistory("sent",
                         document.getElementById("email-to").textContent,
                         document.getElementById("email-subject").textContent);
@@ -787,16 +729,12 @@ const dashboardHTML = `<!DOCTYPE html>
                     document.getElementById("btn-approve").textContent = "✓ APPROVE & SEND";
                     document.getElementById("btn-approve").disabled = false;
                     document.getElementById("btn-reject").disabled = false;
-                    document.getElementById("totp-code").disabled = false;
-                    document.getElementById("totp-code").value = "";
-                    document.getElementById("totp-code").focus();
                 }
             } catch (err) {
                 alert("Error: " + err);
                 document.getElementById("btn-approve").textContent = "✓ APPROVE & SEND";
                 document.getElementById("btn-approve").disabled = false;
                 document.getElementById("btn-reject").disabled = false;
-                document.getElementById("totp-code").disabled = false;
             }
         }
 
@@ -1964,20 +1902,11 @@ func main() {
 	log.Println("═══════════════════════════════════════════════════════════════")
 	log.Printf("   http://localhost:%d/outbox/%s", oobServerPort, approvalSession.ID)
 	log.Println("")
-	log.Println("   Open this URL in your browser to approve outgoing emails.")
+	log.Println("   Open this URL in your browser to view/approve outgoing emails.")
 	log.Println("   The agent CANNOT see or influence this approval process.")
-	log.Println("   Keep this tab open while working with your AI assistant.")
-	log.Println("═══════════════════════════════════════════════════════════════")
 	log.Println("")
-	log.Println("🔐 TOTP SECOND FACTOR (Zero-Trust Enhancement)")
-	log.Println("───────────────────────────────────────────────────────────────")
-	log.Println("   Add this to your authenticator app (Google Authenticator, Authy, etc.):")
-	log.Println("")
-	log.Printf("   Secret: %s", approvalSession.TOTPKey.Secret())
-	log.Println("")
-	log.Printf("   Or scan: %s", approvalSession.TOTPKey.URL())
-	log.Println("")
-	log.Println("   You'll need the 6-digit code to approve emails.")
+	log.Println("   NOTE: Primary approval is via mobile push notification.")
+	log.Println("   Make sure gmail-approval-daemon is running for mobile push.")
 	log.Println("═══════════════════════════════════════════════════════════════")
 	log.Println("")
 
@@ -2336,24 +2265,28 @@ EXAMPLE QUERIES:
 	// Add Send Email ATO tool with OOB approval (Agent Cut-Out Pattern)
 	// ATO = Agent Tomfoolery-proof Operation
 	sendEmailATOTool := mcp.NewTool("send_email_ato",
-		mcp.WithDescription(`Queue an email for user approval via the Agent Cut-Out (ACO) pattern.
+		mcp.WithDescription(`Send an email with user approval via mobile push notification.
 
 This tool implements zero-trust email sending:
 - Agent handles INPUT (provides email content)
-- Control plane and viewport are OUT OF BAND (agent cannot see or influence)
-- Server executes the send (agent never touches it)
+- Approval happens OUT OF BAND on user's phone (agent cannot see or influence)
+- Server executes the send only after user approves
 
 How it works:
 1. You call this tool with to, subject, body
-2. Server creates a draft and queues it for approval
-3. This tool returns IMMEDIATELY with the OOB dashboard URL
-4. Tell the user to open the URL and approve with their TOTP code
-5. The SERVER sends the email directly when approved
+2. Server creates a draft and sends approval request to user's phone
+3. User receives push notification with email preview
+4. User taps Approve or Reject on their phone
+5. This tool waits for the response (up to 5 minutes)
+6. If approved, the email is sent and tool returns success
 
-Returns:
-- {status: "queued", dashboard_url: "...", to: "...", subject: "..."}
+Returns on success:
+- {status: "sent", message: "...", to: "...", subject: "..."}
 
-IMPORTANT: After calling this tool, you MUST give the user the dashboard_url so they can approve.`),
+Returns on rejection or timeout:
+- Error message explaining what happened
+
+NOTE: This tool blocks until the user responds on their phone. Tell the user to check their ntfy app.`),
 		mcp.WithString("to",
 			mcp.Required(),
 			mcp.Description("Recipient email address"),
@@ -2386,11 +2319,6 @@ IMPORTANT: After calling this tool, you MUST give the user the dashboard_url so 
 		}
 		threadID, _ := req.RequireString("thread_id") // optional
 
-		// Check if approval session exists
-		if approvalSession == nil {
-			return mcp.NewToolResultError("Approval session not initialized. The OOB dashboard must be running."), nil
-		}
-
 		// Create draft internally
 		var message gmail.Message
 		headers := fmt.Sprintf("To: %s\r\nSubject: %s\r\n", to, subject)
@@ -2415,22 +2343,39 @@ IMPORTANT: After calling this tool, you MUST give the user the dashboard_url so 
 		draftID := createdDraft.Id
 		log.Printf("📝 Draft created internally: id=%s to=%s subject=%s", draftID, to, subject)
 
-		// Queue the email for approval (non-blocking)
-		_, err = approvalSession.QueueEmail(draftID, to, subject, body)
+		// Send to approval daemon for mobile push approval (blocking)
+		log.Printf("📱 Sending to approval daemon for mobile push approval...")
+		resp, err := sendToDaemon(map[string]string{
+			"action":   "queue_email",
+			"to":       to,
+			"subject":  subject,
+			"body":     body,
+			"draft_id": draftID,
+		})
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		log.Printf("📧 Email queued for approval: to=%s subject=%s", to, subject)
+		success, _ := resp["success"].(bool)
+		if !success {
+			errMsg, _ := resp["error"].(string)
+			return mcp.NewToolResultError(errMsg), nil
+		}
 
-		// Return immediately with dashboard URL
-		dashboardURL := fmt.Sprintf("http://localhost:%d/outbox/%s", oobServerPort, approvalSession.ID)
+		// Approved - send the draft
+		log.Printf("✅ Email approved, sending draft...")
+		err = gmailServer.SendDraft(draftID)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("approved but failed to send: %v", err)), nil
+		}
+
+		log.Printf("📧 Email sent successfully: to=%s subject=%s", to, subject)
+
 		resultJSON, _ := json.MarshalIndent(map[string]interface{}{
-			"status":        "queued",
-			"message":       "Email queued for approval. User must approve via OOB dashboard with TOTP.",
-			"dashboard_url": dashboardURL,
-			"to":            to,
-			"subject":       subject,
+			"status":  "sent",
+			"message": "Email approved and sent successfully",
+			"to":      to,
+			"subject": subject,
 		}, "", "  ")
 		return mcp.NewToolResultText(string(resultJSON)), nil
 	})
