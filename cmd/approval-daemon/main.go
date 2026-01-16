@@ -76,9 +76,27 @@ func run() error {
 		}
 	}
 
-	log.Println("Setup complete. Daemon ready.")
-	log.Printf("ntfy topic: %s", config.NtfyTopic)
+	// Create and start daemon
+	daemon := newApprovalDaemon(config)
 
-	// TODO: Start normal operation
-	select {} // Block forever for now
+	// Start socket server
+	socketServer, err := newSocketServer(daemon)
+	if err != nil {
+		return fmt.Errorf("failed to create socket server: %w", err)
+	}
+	defer socketServer.close()
+
+	// Start polling in background
+	go daemon.startPolling()
+
+	log.Println("═══════════════════════════════════════════════════════════════")
+	log.Println("📱 APPROVAL DAEMON RUNNING")
+	log.Println("═══════════════════════════════════════════════════════════════")
+	log.Printf("   ntfy topic: %s", config.NtfyTopic)
+	log.Printf("   Socket: %s", getSocketPath())
+	log.Println("═══════════════════════════════════════════════════════════════")
+
+	// Run socket server (blocking)
+	socketServer.run()
+	return nil
 }
